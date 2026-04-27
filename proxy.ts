@@ -137,43 +137,187 @@ function sseFromText(response: any): Response {
   );
 }
 
+// ── Smart Compression for ChatGPT web (which has message length limits) ──
+const CHATGPT_MAX_CHARS = 50000; // safe limit for ChatGPT web per-conversation
+
+function estimateChars(messages: any[]): number {
+  return messages.reduce((sum: number, m: any) => {
+    const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
+    return sum + content.length;
+  }, 0);
+}
+
+function compressToolsForChatGPT(tools: any[]): any[] {
+  // Full JSON schema → compact: just name, description, param names+types
+  return tools.map((t: any) => {
+    const fn = t.function || t;
+    const props = fn.parameters?.properties || {};
+    const required = fn.parameters?.required || [];
+    
+    // Build compact param string: "city: string (required), unit: string"
+    const paramParts = Object.entries(props).map(([name, schema]: [string, any]) => {
+      const type = schema.type || "any";
+      const isReq = required.includes(name);
+      const enumVals = schema.enum ? ` [${schema.enum.join("|")}]` : "";
+      return `${name}: ${type}${enumVals}${isReq ? " (required)" : ""}`;
+    });
+    
+    return {
+      type: "function",
+      function: {
+        name: fn.name,
+        description: (fn.description || "").slice(0, 120),
+        parameters: {
+          type: "object",
+          properties: Object.fromEntries(
+            Object.entries(props).map(([k, v]: [string, any]) => [k, { type: v.type || "string" }])
+          ),
+          required,
+        },
+      },
+    };
+  });
+}
+
+function compressMessagesForChatGPT(messages: any[], maxChars: number): any[] {
+  // Strategy: keep system (truncated) + first user + last N messages
+  const result: any[] = [];
+  let totalChars = 0;
+  
+  // 1. System prompt — cap at 15K chars
+  const sysMsg = messages.find((m: any) => m.role === "system");
+  if (sysMsg) {
+    const content = typeof sysMsg.content === "string" ? sysMsg.content : JSON.stringify(sysMsg.content);
+    const maxSys = 15000;
+    if (content.length > maxSys) {
+      result.push({ ...sysMsg, content: content.slice(0, maxSys) + "\n\n[... system prompt truncated for length ...]" });
+      totalChars += maxSys;
+    } else {
+      result.push(sysMsg);
+      totalChars += content.length;
+    }
+  }
+  
+  // 2. Non-system messages — work backwards from most recent, keep what fits
+  const nonSystem = messages.filter((m: any) => m.role !== "system");
+  const kept: any[] = [];
+  
+  for (let i = nonSystem.length - 1; i >= 0; i--) {
+    const msg = nonSystem[i];
+    let content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "");
+    
+    // Truncate individual tool results that are huge
+    if (msg.role === "tool" && content.length > 3000) {
+      content = content.slice(0, 3000) + "\n[... output truncated ...]";
+    }
+    
+    // Truncate assistant messages with huge content
+    if (msg.role === "assistant" && typeof msg.content === "string" && content.length > 5000) {
+      content = content.slice(0, 5000) + "\n[... truncated ...]";
+    }
+    
+    const msgChars = content.length;
+    if (totalChars + msgChars > maxChars && kept.length >= 2) {
+      // We have at least the last 2 messages, stop adding older ones
+      break;
+    }
+    
+    kept.unshift({ ...msg, content });
+    totalChars += msgChars;
+  }
+  
+  result.push(...kept);
+  return result;
+}
+
+function compressBodyForChatGPT(body: any): any {
+  const originalMessages = body.messages || [];
+  const originalTools = body.tools || [];
+  
+  // Estimate original size
+  const toolsJson = JSON.stringify(originalTools);
+  const msgsChars = estimateChars(originalMessages);
+  const totalOriginal = msgsChars + toolsJson.length;
+  
+  if (totalOriginal <= CHATGPT_MAX_CHARS) {
+    // Already small enough, no compression needed
+    return body;
+  }
+  
+  console.log(`[compress] Original: ${(totalOriginal / 1000).toFixed(0)}K chars (${originalMessages.length} msgs, ${originalTools.length} tools)`);
+  
+  // Compress tools first (biggest win usually)
+  const compressedTools = compressToolsForChatGPT(originalTools);
+  const compressedToolsJson = JSON.stringify(compressedTools);
+  const toolsSaved = toolsJson.length - compressedToolsJson.length;
+  
+  // Budget remaining for messages
+  const msgBudget = CHATGPT_MAX_CHARS - compressedToolsJson.length;
+  const compressedMessages = compressMessagesForChatGPT(originalMessages, Math.max(msgBudget, 10000));
+  
+  const newTotal = estimateChars(compressedMessages) + compressedToolsJson.length;
+  console.log(`[compress] Compressed: ${(newTotal / 1000).toFixed(0)}K chars (${compressedMessages.length} msgs, ${compressedTools.length} tools) — saved ${((totalOriginal - newTotal) / 1000).toFixed(0)}K`);
+  
+  return {
+    ...body,
+    messages: compressedMessages,
+    tools: compressedTools,
+  };
+}
+
 // ── ChatGPT tool call emulation (same as upstream, but via ChatGPT provider) ──
 async function handleChatGPTWithTools(body: any): Promise<Response> {
   const hasTools = body.tools?.length > 0;
   const wantStream = body.stream === true;
 
   if (!hasTools) {
+    // Even without tools, compress messages if too large
+    const msgsChars = estimateChars(body.messages || []);
+    if (msgsChars > CHATGPT_MAX_CHARS) {
+      console.log(`[compress] No tools but messages too large (${(msgsChars / 1000).toFixed(0)}K), compressing...`);
+      const compressed = compressMessagesForChatGPT(body.messages || [], CHATGPT_MAX_CHARS);
+      return handleChatGPTRequest({ ...body, messages: compressed });
+    }
     return handleChatGPTRequest(body);
   }
 
-  console.log(`[~] ${body.model} → session-based tool emulation (${body.tools.length} tools)`);
+  // ── Compress before sending to ChatGPT ──
+  body = compressBodyForChatGPT(body);
 
-  // Extract system prompt
+  console.log(`[~] ${body.model} → emulating tool calls via ChatGPT (${body.tools.length} tools)...`);
+
+  const toolPrompt = buildToolSystemPrompt(body.tools);
   const messages = [...(body.messages || [])];
+
+  // ChatGPT web doesn't support system role well — merge system into first user message
   const sysIdx = messages.findIndex((m: any) => m.role === "system");
-  const systemPrompt = sysIdx >= 0 ? messages[sysIdx].content : "";
-
-  // Remove system message from messages (it goes into session setup)
-  const nonSystemMessages = messages.filter((m: any) => m.role !== "system");
-
-  if (body.tool_choice === "required") {
-    nonSystemMessages.push({ role: "user", content: "[SYSTEM: You MUST use at least one tool. Output <tool_call> blocks only.]" });
-  } else if (body.tool_choice?.function) {
-    nonSystemMessages.push({ role: "user", content: `[SYSTEM: You MUST call the "${body.tool_choice.function.name}" tool now.]` });
+  let systemContent = "";
+  if (sysIdx >= 0) {
+    systemContent = messages[sysIdx].content || "";
+    messages.splice(sysIdx, 1); // remove system message
   }
 
-  // Use session-based flow
-  const sessionBody = {
-    ...body,
-    messages: nonSystemMessages,
-    _tools: body.tools,
-    _systemPrompt: systemPrompt,
-    stream: false,
-  };
-  delete sessionBody.tools;
-  delete sessionBody.tool_choice;
+  // Find first user message and prepend system + tools
+  const userIdx = messages.findIndex((m: any) => m.role === "user");
+  if (userIdx >= 0) {
+    const prefix = (systemContent ? systemContent + "\n\n" : "") + toolPrompt + "\n\n---\n\n";
+    messages[userIdx] = { ...messages[userIdx], content: prefix + messages[userIdx].content };
+  } else {
+    // No user message — create one with system + tools
+    messages.push({ role: "user", content: (systemContent ? systemContent + "\n\n" : "") + toolPrompt });
+  }
 
-  const emRes = await handleChatGPTSessionRequest(sessionBody);
+  if (body.tool_choice === "required") {
+    messages.push({ role: "user", content: "[SYSTEM: You MUST use at least one tool. Output <tool_call> blocks only.]" });
+  } else if (body.tool_choice?.function) {
+    messages.push({ role: "user", content: `[SYSTEM: You MUST call the "${body.tool_choice.function.name}" tool now.]` });
+  }
+
+  const emulatedBody = { ...body, messages, stream: false };
+  delete emulatedBody.tools;
+  delete emulatedBody.tool_choice;
+
+  const emRes = await handleChatGPTRequest(emulatedBody);
   if (!emRes.ok) return emRes;
 
   const emResult = await emRes.json() as any;

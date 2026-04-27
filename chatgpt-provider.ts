@@ -50,7 +50,7 @@ const MODEL_MAP: Record<string, string> = {
   "chatgpt/gpt-5.4-thinking":  "gpt-5-4-thinking",
   "chatgpt/gpt-5.4-pro":       "gpt-5-4-pro",
   "chatgpt/gpt-5.4-t-mini":    "gpt-5-4-t-mini",
-  "chatgpt/gpt-5.5":           "gpt-5-5-thinking",
+  "chatgpt/gpt-5.5":           "gpt-5.5",
   "chatgpt/gpt-5.5-thinking":  "gpt-5-5-thinking",
   "chatgpt/gpt-5.5-pro":       "gpt-5-5-pro",
   "chatgpt/deep-research":     "research",
@@ -315,7 +315,12 @@ export async function handleChatGPTRequest(body: any): Promise<Response> {
   try {
     await ensureHelper();
 
-    console.log(`[chatgpt] → ${slug} (${body.messages?.length || 0} messages)`);
+    console.log(`[chatgpt] → ${slug} (${body.messages?.length || 0} messages, first msg ${(body.messages?.[0]?.content || "").length} chars)`);
+    
+    // Debug: log first 200 chars of first message
+    if (body.messages?.[0]) {
+      console.log(`[chatgpt] First msg role=${body.messages[0].role}, content preview: ${(body.messages[0].content || "").slice(0, 200)}`);
+    }
     
     const helperRes = await fetch(`${HELPER_URL}/chat`, {
       method: "POST",
@@ -481,13 +486,32 @@ export async function handleChatGPTSessionRequest(body: any): Promise<Response> 
     }
 
     // ── Build message: system context + tools + actual content, every time ──
+    // Compress system prompt if too large
+    let effectiveSystemPrompt = systemPrompt;
+    if (effectiveSystemPrompt.length > 12000) {
+      console.log(`[chatgpt] Truncating system prompt: ${(effectiveSystemPrompt.length / 1000).toFixed(0)}K → 12K`);
+      effectiveSystemPrompt = effectiveSystemPrompt.slice(0, 12000) + "\n\n[... system prompt truncated ...]";
+    }
+
     const actualContent = messages.map((m: any) => {
-      const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      let content = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+      // Truncate huge tool results
+      if (m.role === "tool" && content.length > 3000) {
+        content = content.slice(0, 3000) + "\n[... output truncated ...]";
+      }
       if (m.role === "assistant") return `[Assistant]: ${content}`;
       if (m.role === "tool") return `[Tool Result (${m.name || "unknown"})]: ${content}`;
       if (m.role === "system") return `[System]: ${content}`;
       return content;
     }).join("\n\n");
+
+    // Cap total message size to avoid 413
+    const maxContentLen = 25000;
+    let finalContent = actualContent;
+    if (actualContent.length > maxContentLen) {
+      console.log(`[chatgpt] Truncating content: ${(actualContent.length / 1000).toFixed(0)}K → ${(maxContentLen / 1000).toFixed(0)}K`);
+      finalContent = actualContent.slice(0, maxContentLen) + "\n\n[... conversation truncated for length ...]";
+    }
 
     const fullMessage = `You are an AI coding assistant with access to real tools that you can execute.
 You MUST use tools to accomplish tasks. NEVER answer from memory or tell the user to do it themselves.
@@ -504,12 +528,12 @@ ${compressedTools}
 
 ---
 
-${actualContent}`;
+${finalContent}`;
 
     const result = await sendToHelper({
       model: slug,
       messages: [
-        ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+        ...(effectiveSystemPrompt ? [{ role: "system", content: effectiveSystemPrompt }] : []),
         { role: "user", content: fullMessage },
       ],
       conversationId: session.conversationId || undefined,
