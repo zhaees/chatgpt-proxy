@@ -546,18 +546,26 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
         except (json.JSONDecodeError, TypeError, AttributeError):
             continue
     
-    # Only cleanup standalone requests (not reused conversations)
+    # Hard delete conversation (not just hide)
     final_conv_id = response_conversation_id or conversation_id
     if final_conv_id and not conversation_id:
         try:
+            headers = {
+                **base_headers(),
+                'Authorization': f'Bearer {token}',
+                'Content-Type': 'application/json',
+            }
+            # Step 1: Archive it
             session.patch(
                 f'{CHATGPT_BASE}/backend-api/conversation/{final_conv_id}',
-                headers={
-                    **base_headers(),
-                    'Authorization': f'Bearer {token}',
-                    'Content-Type': 'application/json',
-                },
-                json={'is_visible': False},
+                headers=headers,
+                json={'is_archived': True},
+                timeout=5,
+            )
+            # Step 2: Hard delete
+            session.delete(
+                f'{CHATGPT_BASE}/backend-api/conversation/{final_conv_id}',
+                headers=headers,
                 timeout=5,
             )
         except:
@@ -641,14 +649,21 @@ class ChatGPTHandler(BaseHTTPRequestHandler):
                 with lock:
                     try:
                         token = refresh_access_token()
+                        headers = {
+                            **base_headers(),
+                            'Authorization': f'Bearer {token}',
+                            'Content-Type': 'application/json',
+                        }
+                        # Archive then hard delete
                         session.patch(
                             f'{CHATGPT_BASE}/backend-api/conversation/{conv_id}',
-                            headers={
-                                **base_headers(),
-                                'Authorization': f'Bearer {token}',
-                                'Content-Type': 'application/json',
-                            },
-                            json={'is_visible': False},
+                            headers=headers,
+                            json={'is_archived': True},
+                            timeout=5,
+                        )
+                        session.delete(
+                            f'{CHATGPT_BASE}/backend-api/conversation/{conv_id}',
+                            headers=headers,
                             timeout=5,
                         )
                         self.send_response(200)
